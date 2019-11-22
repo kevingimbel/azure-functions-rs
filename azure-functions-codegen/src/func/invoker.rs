@@ -1,4 +1,4 @@
-use crate::func::{get_generic_argument_type, OutputBindings};
+use crate::func::{get_generic_argument_type, FunctionType, OutputBindings};
 use azure_functions_shared::codegen::{bindings::TRIGGERS, last_segment_in_path};
 use azure_functions_shared::util::to_camel_case;
 use proc_macro2::TokenStream;
@@ -9,7 +9,7 @@ const INVOKER_PREFIX: &str = "__invoke_";
 
 pub struct Invoker<'a> {
     pub func: &'a ItemFn,
-    pub is_orchestration: bool,
+    pub func_type: FunctionType,
 }
 
 impl<'a> Invoker<'a> {
@@ -33,11 +33,134 @@ impl<'a> Invoker<'a> {
             _ => false,
         }
     }
+
+    fn get_orchestration_invoker(&self, ident: Ident) -> TokenStream {
+        let common_tokens = CommonInvokerTokens {
+            func: &self.func,
+            func_type: self.func_type,
+        };
+
+        quote!(
+            #[allow(dead_code)]
+            fn #ident(
+                __req: ::azure_functions::rpc::InvocationRequest,
+            ) -> ::azure_functions::rpc::InvocationResponse {
+                #common_tokens
+
+                ::azure_functions::durable::orchestrate(
+                    __req.invocation_id,
+                    __ret,
+                    __state,
+                )
+            }
+        )
+    }
+
+    fn get_async_entity_invoker(&self, ident: Ident) -> TokenStream {
+        TokenStream::new()
+    }
+
+    fn get_entity_invoker(&self, ident: Ident) -> TokenStream {
+        let common_tokens = CommonInvokerTokens {
+            func: &self.func,
+            func_type: self.func_type,
+        };
+
+        quote!(
+            #[allow(dead_code)]
+            fn #ident(
+                __req: ::azure_functions::rpc::InvocationRequest,
+            ) -> ::azure_functions::rpc::InvocationResponse {
+                #common_tokens
+
+                ::azure_functions::durable::orchestrate(
+                    __req.invocation_id,
+                    __ret,
+                    __state,
+                )
+            }
+        )
+    }
+
+    fn get_async_invoker(&self, ident: Ident) -> TokenStream {
+        let async_ident = Ident::new(&format!("{}_async", ident), self.func.sig.ident.span());
+
+        let common_tokens = CommonInvokerTokens {
+            func: &self.func,
+            func_type: self.func_type,
+        };
+
+        let output_bindings = OutputBindings { func: self.func };
+
+        quote!(
+            #[allow(dead_code)]
+            async fn #async_ident(
+                __req: ::azure_functions::rpc::InvocationRequest,
+            ) -> ::azure_functions::rpc::InvocationResponse {
+                #common_tokens
+
+                let __ret = __ret.await;
+
+                let __id = __req.invocation_id;
+
+                let mut __res = ::azure_functions::rpc::InvocationResponse {
+                    invocation_id: __id,
+                    result: Some(::azure_functions::rpc::StatusResult {
+                        status: ::azure_functions::rpc::status_result::Status::Success as i32,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                };
+
+                #output_bindings
+
+                __res
+            }
+
+            #[allow(dead_code)]
+            fn #ident(
+                __req: ::azure_functions::rpc::InvocationRequest,
+            ) -> ::azure_functions::codegen::InvocationFuture {
+                std::boxed::Box::pin(#async_ident(__req))
+            }
+        )
+    }
+
+    fn get_invoker(&self, ident: Ident) -> TokenStream {
+        let common_tokens = CommonInvokerTokens {
+            func: &self.func,
+            func_type: self.func_type,
+        };
+
+        let output_bindings = OutputBindings { func: self.func };
+
+        quote!(
+            #[allow(dead_code)]
+            fn #ident(
+                __req: ::azure_functions::rpc::InvocationRequest,
+            ) -> ::azure_functions::rpc::InvocationResponse {
+                #common_tokens
+
+                let mut __res = ::azure_functions::rpc::InvocationResponse {
+                    invocation_id: __req.invocation_id,
+                    result: Some(::azure_functions::rpc::StatusResult {
+                        status: ::azure_functions::rpc::status_result::Status::Success as i32,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                };
+
+                #output_bindings
+
+                __res
+            }
+        )
+    }
 }
 
 struct CommonInvokerTokens<'a> {
     pub func: &'a ItemFn,
-    pub is_orchestration: bool,
+    pub func_type: FunctionType,
 }
 
 impl<'a> CommonInvokerTokens<'a> {
@@ -84,10 +207,11 @@ impl<'a> CommonInvokerTokens<'a> {
     }
 
     fn get_state_arg(&self, trigger: &Ident) -> TokenStream {
-        if self.is_orchestration {
-            quote!(let __state = #trigger.as_ref().unwrap().state();)
-        } else {
-            TokenStream::new()
+        match self.func_type {
+            FunctionType::Orchestration => {
+                quote!(let __state = #trigger.as_ref().unwrap().state();)
+            }
+            _ => TokenStream::new(),
         }
     }
 
@@ -176,85 +300,15 @@ impl ToTokens for Invoker<'_> {
             self.func.sig.ident.span(),
         );
 
-        let common_tokens = CommonInvokerTokens {
-            func: &self.func,
-            is_orchestration: self.is_orchestration,
-        };
-
-        let output_bindings = OutputBindings {
-            func: self.func,
-            is_orchestration: self.is_orchestration,
-        };
-
-        if self.is_orchestration {
-            quote!(
-                #[allow(dead_code)]
-                fn #ident(
-                    __req: ::azure_functions::rpc::InvocationRequest,
-                ) -> ::azure_functions::rpc::InvocationResponse {
-                    #common_tokens
-
-                    ::azure_functions::durable::orchestrate(
-                        __req.invocation_id,
-                        __ret,
-                        __state,
-                    )
-                }
-            )
-            .to_tokens(tokens);
-        } else if self.func.sig.asyncness.is_some() {
-            quote!(
-                #[allow(dead_code)]
-                fn #ident(
-                    __req: ::azure_functions::rpc::InvocationRequest,
-                ) -> ::azure_functions::codegen::InvocationFuture {
-                    #common_tokens
-
-                    use futures::future::FutureExt;
-
-                    let __id = __req.invocation_id;
-
-                    Box::pin(
-                        __ret.then(move |__ret| {
-                            let mut __res = ::azure_functions::rpc::InvocationResponse {
-                                invocation_id: __id,
-                                result: Some(::azure_functions::rpc::StatusResult {
-                                    status: ::azure_functions::rpc::status_result::Status::Success as i32,
-                                    ..Default::default()
-                                }),
-                                ..Default::default()
-                            };
-
-                            #output_bindings
-
-                            ::futures::future::ready(__res)
-                        })
-                    )
-                }
-            ).to_tokens(tokens);
-        } else {
-            quote!(
-                #[allow(dead_code)]
-                fn #ident(
-                    __req: ::azure_functions::rpc::InvocationRequest,
-                ) -> ::azure_functions::rpc::InvocationResponse {
-                    #common_tokens
-
-                    let mut __res = ::azure_functions::rpc::InvocationResponse {
-                        invocation_id: __req.invocation_id,
-                        result: Some(::azure_functions::rpc::StatusResult {
-                            status: ::azure_functions::rpc::status_result::Status::Success as i32,
-                            ..Default::default()
-                        }),
-                        ..Default::default()
-                    };
-
-                    #output_bindings
-
-                    __res
-                }
-            )
-            .to_tokens(tokens);
+        match self.func_type {
+            FunctionType::Orchestration => self.get_orchestration_invoker(ident),
+            FunctionType::Entity if self.func.sig.asyncness.is_some() => {
+                self.get_async_entity_invoker(ident)
+            }
+            FunctionType::Entity => self.get_entity_invoker(ident),
+            _ if self.func.sig.asyncness.is_some() => self.get_async_invoker(ident),
+            _ => self.get_invoker(ident),
         }
+        .to_tokens(tokens);
     }
 }
